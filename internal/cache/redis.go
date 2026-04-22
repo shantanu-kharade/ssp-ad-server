@@ -116,6 +116,31 @@ func (r *RedisClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Incr atomically increments the integer value stored at key by 1 and returns
+// the new value. If the key does not exist it is created with value 1.
+func (r *RedisClient) Incr(ctx context.Context, key string) (int64, error) {
+	val, err := r.client.Incr(ctx, key).Result()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, ErrCacheTimeout
+		}
+		return 0, ErrCacheUnavailable
+	}
+	return val, nil
+}
+
+// Expire sets a TTL on the given key. It is a no-op if the key does not exist.
+func (r *RedisClient) Expire(ctx context.Context, key string, ttl time.Duration) error {
+	err := r.client.Expire(ctx, key, ttl).Err()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return ErrCacheTimeout
+		}
+		return ErrCacheUnavailable
+	}
+	return nil
+}
+
 // Close shuts down the Redis connection pool.
 func (r *RedisClient) Close() error {
 	return r.client.Close()

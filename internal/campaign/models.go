@@ -7,16 +7,20 @@ import (
 
 // Campaign represents an advertising campaign.
 type Campaign struct {
-	ID            string          `json:"id"`
-	Name          string          `json:"name"`
-	AdvertiserID  string          `json:"advertiser_id"`
-	Status        string          `json:"status"` // "active", "paused", "completed"
-	BudgetCents   int64           `json:"budget_cents"`
-	SpentCents    int64           `json:"spent_cents"`
-	StartDate     time.Time       `json:"start_date"`
-	EndDate       time.Time       `json:"end_date"`
-	CreatedAt     time.Time       `json:"created_at"`
-	Creatives     []Creative      `json:"creatives"`
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	AdvertiserID   string          `json:"advertiser_id"`
+	Status         string          `json:"status"` // "active", "paused", "completed"
+	BudgetCents    int64           `json:"budget_cents"`
+	SpentCents     int64           `json:"spent_cents"`
+	// BidPriceCPM is the effective CPM bid price in USD for this campaign.
+	// This is the price submitted to the auction — it is completely independent
+	// of the total budget. A campaign with a $500 budget may bid $1.50 CPM.
+	BidPriceCPM    float64         `json:"bid_price_cpm"`
+	StartDate      time.Time       `json:"start_date"`
+	EndDate        time.Time       `json:"end_date"`
+	CreatedAt      time.Time       `json:"created_at"`
+	Creatives      []Creative      `json:"creatives"`
 	TargetingRules []TargetingRule `json:"targeting_rules"`
 }
 

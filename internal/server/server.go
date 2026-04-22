@@ -32,6 +32,9 @@ func New(cfg *config.Config, log *zap.Logger, redisClient *cache.RedisClient, db
 	app := fiber.New(fiber.Config{
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
+		// Limit the request body size to 1MB to prevent OOM attacks and large memory allocations.
+		// If a request exceeds this, Fiber returns HTTP 413 Payload Too Large.
+		BodyLimit: 1 * 1024 * 1024,
 		// Return structured JSON errors instead of Fiber's default text.
 		ErrorHandler: customErrorHandler(log),
 		// Disable the startup banner for cleaner log output.
@@ -52,8 +55,10 @@ func New(cfg *config.Config, log *zap.Logger, redisClient *cache.RedisClient, db
 	// Structured metrics logging
 	app.Use(middleware.Metrics(log))
 
-	// Global rate limiter middleware (e.g., 1000 RPS)
-	globalLimiter := resilience.NewGlobalRateLimiter(2000)
+	// Global rate limiter — Redis-backed sliding window so all pods share the
+	// same counter. Without this, 3 pods each allow 10,000 RPS independently,
+	// giving clients an effective 30,000 RPS limit.
+	globalLimiter := resilience.NewRedisRateLimiter(10000, redisClient, log)
 	app.Use(middleware.RateLimit(globalLimiter, log))
 
 	// Parse DSP Configuration

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/yourusername/ssp-adserver/internal/auction"
@@ -14,6 +15,15 @@ import (
 	"github.com/yourusername/ssp-adserver/internal/resilience"
 	"go.uber.org/zap"
 )
+
+// bufPool recycles *bytes.Buffer instances across DSP bid request serializations.
+// At high QPS (5,000+), json.Marshal allocates a new []byte on every call.
+// Pooling the buffer eliminates those short-lived allocations, reducing GC pressure
+// and CPU spikes from constant collection. Each buffer is Reset() before reuse
+// so stale data is never forwarded.
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
 
 var (
 	ErrNoBid           = errors.New("no bid (204)")
@@ -33,9 +43,42 @@ func NewClient(cfg Config, log *zap.Logger) *Client {
 	return &Client{
 		config: cfg,
 		http: &http.Client{
-			// The overall timeout is enforced by the context in FetchBid,
-			// but we can set a fallback timeout on the client itself.
+			// The overall per-request deadline is enforced by the context passed into
+			// FetchBid. The transport-level timeout below acts as an absolute safety net
+			// in case a context is ever constructed without a deadline.
 			Timeout: time.Duration(cfg.TimeoutMs) * time.Millisecond,
+
+			Transport: &http.Transport{
+				// --- Connection Pool Tuning ---
+				//
+				// MaxIdleConnsPerHost: Go's default is 2.
+				// At 5,000 QPS with 3 DSPs each pod sends ~1,667 req/s per DSP.
+				// With only 2 idle connections, almost every request that arrives
+				// while both connections are in-flight must open a new TCP socket:
+				// that means a full TCP handshake (~1-5ms RTT) on each miss.
+				// 100 idle connections per host ensures the pool is deep enough to
+				// absorb realistic concurrency spikes without exhausting keep-alives.
+				MaxIdleConnsPerHost: 100,
+
+				// MaxIdleConns: total idle connections across ALL hosts.
+				// With 3 DSP hosts × 100 per-host = 300 max needed. Setting this
+				// equal to 3×MaxIdleConnsPerHost prevents the global pool from
+				// silently capping per-host connections below our target.
+				MaxIdleConns: 300,
+
+				// IdleConnTimeout: how long an unused connection stays in the pool
+				// before it is closed. 90s matches common server-side keepalive
+				// timeouts (nginx default: 75s) with a small margin. Too short =
+				// connections expire before they can be reused; too long = wasted
+				// file descriptors and potential silent half-close issues.
+				IdleConnTimeout: 90 * time.Second,
+
+				// DisableKeepAlives: must be false (the zero value) so that TCP
+				// connections are reused across requests. Setting this to true would
+				// force a new handshake on every single DSP call, negating all of
+				// the tuning above.
+				DisableKeepAlives: false,
+			},
 		},
 		cb: resilience.NewDSPCircuitBreaker(cfg.Name, log),
 	}
@@ -78,12 +121,19 @@ func (c *Client) FetchBid(ctx context.Context, req models.BidRequest) ([]auction
 }
 
 func (c *Client) doFetch(ctx context.Context, req models.BidRequest) ([]auction.Bid, error) {
-	reqBody, err := json.Marshal(req)
-	if err != nil {
+	// Acquire a pooled buffer, encode the request JSON into it, then immediately
+	// return the buffer to the pool once the HTTP request body is set up.
+	// bytes.NewReader copies the buffer bytes, so it is safe to recycle the buffer
+	// before the HTTP request is dispatched.
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	if err := json.NewEncoder(buf).Encode(req); err != nil {
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.URL, bytes.NewReader(reqBody))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.URL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		return nil, err
 	}

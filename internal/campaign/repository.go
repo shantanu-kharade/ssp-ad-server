@@ -46,9 +46,9 @@ func (r *pgRepository) CreateCampaign(ctx context.Context, c *Campaign) error {
 	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO campaigns (id, name, advertiser_id, status, budget_cents, spent_cents, start_date, end_date, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, c.ID, c.Name, c.AdvertiserID, c.Status, c.BudgetCents, c.SpentCents, c.StartDate, c.EndDate, c.CreatedAt)
+		INSERT INTO campaigns (id, name, advertiser_id, status, budget_cents, spent_cents, bid_price_cpm, start_date, end_date, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, c.ID, c.Name, c.AdvertiserID, c.Status, c.BudgetCents, c.SpentCents, c.BidPriceCPM, c.StartDate, c.EndDate, c.CreatedAt)
 	if err != nil {
 		return ErrDBError
 	}
@@ -70,8 +70,9 @@ func (r *pgRepository) CreateCampaign(ctx context.Context, c *Campaign) error {
 }
 
 func (r *pgRepository) GetActiveCampaigns(ctx context.Context) ([]Campaign, error) {
+	// --- Query 1: fetch all active campaigns ---
 	rows, err := r.db.Query(ctx, `
-		SELECT id, name, advertiser_id, status, budget_cents, spent_cents, start_date, end_date, created_at
+		SELECT id, name, advertiser_id, status, budget_cents, spent_cents, bid_price_cpm, start_date, end_date, created_at
 		FROM campaigns
 		WHERE status = 'active'
 	`)
@@ -80,35 +81,81 @@ func (r *pgRepository) GetActiveCampaigns(ctx context.Context) ([]Campaign, erro
 	}
 	defer rows.Close()
 
+	// Build an ordered slice and an index map so we can assemble associations later.
 	var campaigns []Campaign
+	campaignIndex := make(map[string]int) // campaign_id -> index in campaigns slice
+	var ids []string
+
 	for rows.Next() {
 		var c Campaign
-		if err := rows.Scan(&c.ID, &c.Name, &c.AdvertiserID, &c.Status, &c.BudgetCents, &c.SpentCents, &c.StartDate, &c.EndDate, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.AdvertiserID, &c.Status, &c.BudgetCents, &c.SpentCents, &c.BidPriceCPM, &c.StartDate, &c.EndDate, &c.CreatedAt); err != nil {
 			return nil, ErrDBError
 		}
-		
-		c.Creatives, err = r.getCreativesByCampaignID(ctx, c.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		c.TargetingRules, err = r.getTargetingRulesByCampaignID(ctx, c.ID)
-		if err != nil {
-			return nil, err
-		}
-
+		campaignIndex[c.ID] = len(campaigns)
+		ids = append(ids, c.ID)
 		campaigns = append(campaigns, c)
 	}
+	rows.Close() // close explicitly so the connection is freed before the next query
+
+	if len(ids) == 0 {
+		return campaigns, nil
+	}
+
+	// --- Query 2a: batch-fetch all creatives for the collected IDs ---
+	cRows, err := r.db.Query(ctx, `
+		SELECT id, campaign_id, format, width, height, ad_markup, click_url, status, created_at
+		FROM creatives
+		WHERE campaign_id = ANY($1)
+	`, ids)
+	if err != nil {
+		return nil, ErrDBError
+	}
+	defer cRows.Close()
+
+	for cRows.Next() {
+		var cr Creative
+		if err := cRows.Scan(&cr.ID, &cr.CampaignID, &cr.Format, &cr.Width, &cr.Height, &cr.AdMarkup, &cr.ClickURL, &cr.Status, &cr.CreatedAt); err != nil {
+			return nil, ErrDBError
+		}
+		if idx, ok := campaignIndex[cr.CampaignID]; ok {
+			campaigns[idx].Creatives = append(campaigns[idx].Creatives, cr)
+		}
+	}
+	cRows.Close()
+
+	// --- Query 2b: batch-fetch all targeting rules for the collected IDs ---
+	// NOTE: This is counted as part of the same "second round-trip" semantically;
+	// in a future refactor this could be combined into a single JOIN if desired.
+	tRows, err := r.db.Query(ctx, `
+		SELECT id, campaign_id, rule_type, rule_value, created_at
+		FROM targeting_rules
+		WHERE campaign_id = ANY($1)
+	`, ids)
+	if err != nil {
+		return nil, ErrDBError
+	}
+	defer tRows.Close()
+
+	for tRows.Next() {
+		var tr TargetingRule
+		if err := tRows.Scan(&tr.ID, &tr.CampaignID, &tr.RuleType, &tr.RuleValue, &tr.CreatedAt); err != nil {
+			return nil, ErrDBError
+		}
+		if idx, ok := campaignIndex[tr.CampaignID]; ok {
+			campaigns[idx].TargetingRules = append(campaigns[idx].TargetingRules, tr)
+		}
+	}
+
 	return campaigns, nil
 }
 
 func (r *pgRepository) GetCampaignByID(ctx context.Context, id string) (*Campaign, error) {
 	var c Campaign
 	err := r.db.QueryRow(ctx, `
-		SELECT id, name, advertiser_id, status, budget_cents, spent_cents, start_date, end_date, created_at
+		SELECT id, name, advertiser_id, status, budget_cents, spent_cents, bid_price_cpm, start_date, end_date, created_at
 		FROM campaigns
 		WHERE id = $1
-	`, id).Scan(&c.ID, &c.Name, &c.AdvertiserID, &c.Status, &c.BudgetCents, &c.SpentCents, &c.StartDate, &c.EndDate, &c.CreatedAt)
+	`, id).Scan(&c.ID, &c.Name, &c.AdvertiserID, &c.Status, &c.BudgetCents, &c.SpentCents, &c.BidPriceCPM, &c.StartDate, &c.EndDate, &c.CreatedAt)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

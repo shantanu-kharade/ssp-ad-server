@@ -10,6 +10,7 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/yourusername/ssp-adserver/internal/ads"
 	"github.com/yourusername/ssp-adserver/internal/auction"
@@ -35,12 +36,13 @@ type BidHandler struct {
 	houseAds    *ads.HouseAdProvider
 	campaignSvc *campaign.Service
 	producer    *events.EventProducer
+	eventQueue  chan events.ImpressionEvent
 }
 
 // NewBidHandler creates a new BidHandler with an initialised validator
 // and the provided logger.
 func NewBidHandler(log *zap.Logger, segments *cache.SegmentFetcher, resolver *identity.Resolver, consent *identity.Validator, fanout *dsp.FanoutCoordinator, houseAds *ads.HouseAdProvider, campaignSvc *campaign.Service, producer *events.EventProducer) *BidHandler {
-	return &BidHandler{
+	h := &BidHandler{
 		validate:    validator.New(),
 		log:         log,
 		segments:    segments,
@@ -50,6 +52,24 @@ func NewBidHandler(log *zap.Logger, segments *cache.SegmentFetcher, resolver *id
 		houseAds:    houseAds,
 		campaignSvc: campaignSvc,
 		producer:    producer,
+		eventQueue:  make(chan events.ImpressionEvent, 10000),
+	}
+
+	// Start bounded worker pool for impression events
+	for  i := 0; i < 16; i++ {
+		go h.eventWorker()
+	}
+
+	return h
+}
+
+func (h *BidHandler) eventWorker() {
+	for event := range h.eventQueue {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := h.producer.PublishImpressionEvent(ctx, event); err != nil {
+			h.log.Error("failed to publish impression event asynchronously", zap.Error(err), zap.String("request_id", event.RequestID))
+		}
+		cancel()
 	}
 }
 
@@ -118,31 +138,84 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 		return c.Status(apiErr.StatusCode).JSON(apiErr)
 	}
 
-	// Fetch user segments
-	userSegments := h.segments.FetchUserSegments(c.Context(), userID)
+	// -------------------------------------------------------------------------
+	// Parallel Bid Pipeline
+	// -------------------------------------------------------------------------
+	// The three data-fetching operations below are independent of each other
+	// and are run concurrently to collapse their wall-clock time:
+	//
+	//   Goroutine A: segment fetch + campaign evaluation (sequential within A,
+	//                because EvaluateTargeting needs the segment results).
+	//                Typical cost: ~10ms Redis + ~5ms Redis/DB cache hit.
+	//
+	//   Goroutine B: DSP fanout — fires HTTP requests to all demand partners.
+	//                Typical cost: 50-80ms (dominant latency).
+	//
+	// Before: total sequential cost ≈ 15ms + 70ms = 85ms before auction.
+	// After:  total cost ≈ max(15ms, 70ms) = 70ms — saving ~15ms of SLA budget.
+	//
+	// errgroup.WithContext propagates cancellation if the parent context is
+	// cancelled (e.g. the 100ms Fiber timeout fires). Neither goroutine returns
+	// a fatal error — they each degrade gracefully on failure.
+	// -------------------------------------------------------------------------
 
-	// Evaluate targeting
-	matchedCampaigns, err := h.campaignSvc.EvaluateTargeting(c.Context(), req, userSegments)
-	if err != nil {
-		h.log.Warn("targeting evaluation failed", zap.Error(err))
-	}
+	var (
+		userSegments    []string
+		matchedCampaigns []campaign.Campaign
+		dspBids         []auction.Bid
+	)
 
-	// For demonstration, map internal matching campaigns to mock bids if no DSP responses
-	// In a full implementation, you might pass these matched campaigns into the auction directly
-	// or append them as a special seat.
+	g, gCtx := errgroup.WithContext(c.Context())
+
+	// Goroutine A: Redis segment lookup → campaign targeting evaluation.
+	// Failures are non-fatal: we degrade to empty segments / no internal bids.
+	g.Go(func() error {
+		userSegments = h.segments.FetchUserSegments(gCtx, userID)
+
+		var evalErr error
+		matchedCampaigns, evalErr = h.campaignSvc.EvaluateTargeting(gCtx, req, userSegments)
+		if evalErr != nil {
+			h.log.Warn("targeting evaluation failed — continuing with no internal bids",
+				zap.Error(evalErr),
+				zap.String("request_id", req.ID),
+			)
+		}
+		return nil // always nil — errors are soft
+	})
+
+	// Goroutine B: DSP fanout. FetchBids handles its own error/timeout logic
+	// and returns an empty slice on failure, so we never return a hard error.
+	g.Go(func() error {
+		dspBids = h.fanout.FetchBids(gCtx, req)
+		return nil // always nil — FetchBids degrades gracefully
+	})
+
+	// Wait for both goroutines. Because both always return nil this can only
+	// fail if the parent context is cancelled.
+	_ = g.Wait()
+
+	// Map matched internal campaigns to auction bids.
 	var internalBids []auction.Bid
 	for _, camp := range matchedCampaigns {
-		if len(camp.Creatives) > 0 {
-			cr := camp.Creatives[0]
-			internalBids = append(internalBids, auction.Bid{
-				DealID:     camp.ID,
-				DealType:   auction.PG, // Internal campaigns might have high priority
-				Price:      float64(camp.BudgetCents) / 100.0, // Simplified price
-				AdID:       cr.ID,
-				DSPName:    "internal",
-				CreativeID: cr.ID,
-			})
+		if len(camp.Creatives) == 0 {
+			continue
 		}
+		if camp.BidPriceCPM <= 0 {
+			h.log.Warn("skipping internal campaign with no configured bid price",
+				zap.String("campaign_id", camp.ID),
+				zap.String("campaign_name", camp.Name),
+			)
+			continue
+		}
+		cr := camp.Creatives[0]
+		internalBids = append(internalBids, auction.Bid{
+			DealID:     camp.ID,
+			DealType:   auction.PG,
+			Price:      camp.BidPriceCPM,
+			AdID:       cr.ID,
+			DSPName:    "internal",
+			CreativeID: cr.ID,
+		})
 	}
 
 	h.log.Info("processing bid request",
@@ -153,10 +226,7 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 		zap.Int("matched_campaigns", len(matchedCampaigns)),
 	)
 
-	// Use real DSP fan-out
-	dspBids := h.fanout.FetchBids(c.Context(), req)
-	
-	// Combine internal bids and DSP bids
+	// Combine internal bids and DSP bids for the auction.
 	bids := append(dspBids, internalBids...)
 
 	// Extract BidFloor from the first impression
@@ -236,41 +306,35 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 		}
 	}
 
-	// Publish ImpressionEvent asynchronously.
-	// NOTE: This goroutine is intentionally fire-and-forget — we do not block the
-	// bid response on event publishing. The goroutine is bounded by a 2s context
-	// timeout, ensuring it will not leak.
-	go func(eventReqID, bidID, impID, dealID, crID, userID string, winPrice, floorPrice float64) {
-		// TODO: context.Background() is used because the Fiber request context
-		// will be cancelled once the HTTP response is sent, but we need the
-		// event publish to outlive the request lifecycle.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
+	// Publish ImpressionEvent asynchronously via the bounded worker pool.
+	// We construct the event synchronously and use a non-blocking send to
+	// prevent the bid response from blocking if the Kafka publisher is slow.
+	event := events.ImpressionEvent{
+		RequestID:    req.ID,
+		BidID:        bidID,
+		ImpressionID: impID,
+		CampaignID:   dealID,
+		CreativeID:   creativeID,
+		WinPrice:     winPrice,
+		UserID:       userID,
+		Timestamp:    time.Now().UTC(),
+		FloorPrice:   floor,
+	}
 
-		event := events.ImpressionEvent{
-			RequestID:    eventReqID,
-			BidID:        bidID,
-			ImpressionID: impID,
-			CampaignID:   dealID,
-			CreativeID:   crID,
-			WinPrice:     winPrice,
-			UserID:       userID,
-			Timestamp:    time.Now().UTC(),
-			FloorPrice:   floorPrice,
+	if req.Device != nil {
+		event.DeviceType = req.Device.DeviceType
+		if req.Device.Geo != nil {
+			event.GeoCountry = req.Device.Geo.Country
+			event.GeoCity = req.Device.Geo.City
 		}
+	}
 
-		if req.Device != nil {
-			event.DeviceType = req.Device.DeviceType
-			if req.Device.Geo != nil {
-				event.GeoCountry = req.Device.Geo.Country
-				event.GeoCity = req.Device.Geo.City
-			}
-		}
-
-		if err := h.producer.PublishImpressionEvent(ctx, event); err != nil {
-			h.log.Error("failed to publish impression event asynchronously", zap.Error(err), zap.String("request_id", eventReqID))
-		}
-	}(req.ID, bidID, impID, dealID, creativeID, userID, winPrice, floor)
+	select {
+	case h.eventQueue <- event:
+		// Successfully queued
+	default:
+		h.log.Warn("event queue full, dropping impression event", zap.String("request_id", req.ID))
+	}
 
 	return c.Status(fiber.StatusOK).JSON(response)
 }

@@ -1,4 +1,4 @@
-.PHONY: build run test test-race lint clean dev tidy help migrate-up migrate-down
+.PHONY: build run test test-race lint clean dev tidy help migrate-up migrate-down docker-up docker-down
 
 # Binary output
 BINARY_NAME=ssp-adserver.exe
@@ -61,6 +61,16 @@ migrate-down:
 	@echo Running down migrations...
 	migrate -path $(MIGRATIONS_DIR) -database "$(DB_URL)" down -all
 
+## docker-up: Spin up the local development stack with Docker Compose
+docker-up:
+	@echo Starting local stack...
+	docker compose up -d
+
+## docker-down: Tear down the local development stack
+docker-down:
+	@echo Stopping local stack...
+	docker compose down
+
 ## clean: Remove build artifacts
 clean:
 	@echo Cleaning...
@@ -78,5 +88,7 @@ help:
 	@echo   tidy         - Tidy and verify module dependencies
 	@echo   migrate-up   - Run database up migrations
 	@echo   migrate-down - Run database down migrations
+	@echo   docker-up    - Spin up the local development stack
+	@echo   docker-down  - Tear down the local development stack
 	@echo   clean        - Remove build artifacts
 
