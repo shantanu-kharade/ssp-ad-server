@@ -2,13 +2,16 @@ package dsp
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/yourusername/ssp-adserver/internal/auction"
+	"github.com/yourusername/ssp-adserver/internal/metrics"
 	"github.com/yourusername/ssp-adserver/internal/models"
+	"github.com/yourusername/ssp-adserver/internal/resilience"
 )
 
 // FanoutCoordinator manages parallel bid requests to multiple DSPs.
@@ -33,6 +36,9 @@ func (f *FanoutCoordinator) Clients() []*Client {
 // FetchBids sends the bid request to all configured DSPs in parallel.
 // It enforces a 50ms hard timeout and collects all valid responses.
 func (f *FanoutCoordinator) FetchBids(ctx context.Context, req models.BidRequest) []auction.Bid {
+	publisherID := publisherFromRequest(req)
+	auctionID := req.ID
+
 	// Enforce hard 50ms timeout for the entire fanout operation.
 	timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
@@ -47,25 +53,44 @@ func (f *FanoutCoordinator) FetchBids(ctx context.Context, req models.BidRequest
 
 			start := time.Now()
 			bids, err := c.FetchBid(timeoutCtx, req)
-			latency := time.Since(start).Milliseconds()
+			duration := time.Since(start)
+			latency := duration.Milliseconds()
+
+			metrics.DSPBidLatencySeconds.WithLabelValues(c.Name()).Observe(duration.Seconds())
 
 			if err != nil {
-				f.log.Warn("dsp failed",
-					zap.String("dsp", c.Name()),
-					zap.Error(err),
-					zap.Int64("latency_ms", latency),
+				if errors.Is(err, ErrTimeout) {
+					f.log.Warn("dsp timeout",
+						zap.String("dsp_id", c.Name()),
+						zap.Int64("elapsed_ms", latency),
+						zap.String("request_id", req.ID),
+						zap.String("publisher_id", publisherID),
+						zap.String("auction_id", auctionID),
+					)
+					return
+				}
+
+				f.log.Error("dsp request failed",
 					zap.String("request_id", req.ID),
+					zap.String("publisher_id", publisherID),
+					zap.String("auction_id", auctionID),
+					zap.Int64("elapsed_ms", latency),
+					zap.String("dsp_id", c.Name()),
+					zap.Error(err),
 				)
+				if errors.Is(err, resilience.ErrCircuitOpen) {
+					f.log.Error("dsp circuit breaker open",
+						zap.String("request_id", req.ID),
+						zap.String("publisher_id", publisherID),
+						zap.String("auction_id", auctionID),
+						zap.Int64("elapsed_ms", latency),
+						zap.String("dsp_id", c.Name()),
+					)
+				}
 				return
 			}
 
 			if len(bids) > 0 {
-				f.log.Info("dsp responded with bids",
-					zap.String("dsp", c.Name()),
-					zap.Int("bid_count", len(bids)),
-					zap.Int64("latency_ms", latency),
-					zap.String("request_id", req.ID),
-				)
 				results <- bids
 			}
 		}(client)
@@ -83,4 +108,14 @@ func (f *FanoutCoordinator) FetchBids(ctx context.Context, req models.BidRequest
 	}
 
 	return allBids
+}
+
+func publisherFromRequest(req models.BidRequest) string {
+	if req.Site != nil && req.Site.Publisher != nil && req.Site.Publisher.ID != "" {
+		return req.Site.Publisher.ID
+	}
+	if req.App != nil && req.App.Publisher != nil && req.App.Publisher.ID != "" {
+		return req.App.Publisher.ID
+	}
+	return "unknown"
 }

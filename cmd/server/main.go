@@ -9,7 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -35,6 +42,18 @@ func main() {
 	defer func() {
 		// Flush any buffered log entries on shutdown.
 		_ = logger.Sync()
+	}()
+
+	tracerShutdown, err := initTracerProvider(context.Background())
+	if err != nil {
+		logger.Fatal("failed to initialize OpenTelemetry tracer provider", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerShutdown(shutdownCtx); err != nil {
+			logger.Error("failed to shut down tracer provider", zap.Error(err))
+		}
 	}()
 
 	// Initialize Redis cache client
@@ -121,4 +140,43 @@ func buildLogger(level string) (*zap.Logger, error) {
 	}
 
 	return logger, nil
+}
+
+func initTracerProvider(ctx context.Context) (func(context.Context) error, error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "localhost:4317"
+	}
+
+	exp, err := otlptracegrpc.New(
+		ctx,
+		otlptracegrpc.WithEndpoint(endpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
+	}
+
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("ssp-adserver"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build OpenTelemetry resource: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tp.Shutdown, nil
 }

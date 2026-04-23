@@ -1,16 +1,19 @@
 services:
   ssp:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: ssp-ad-server
     ports:
       - "8080:8080"
     environment:
       - SERVER_PORT=8080
       - LOG_LEVEL=debug
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otelcollector:4317
       - DB_URL=postgres://ssp:ssp@postgres:5432/ssp_db?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - KAFKA_BROKERS=kafka:9092
-      - DSP_ENDPOINTS=[{"name":"dsp-1","url":"http://dsp-1/status/204","timeout_ms":50,"weight":1},{"name":"dsp-2","url":"http://dsp-2/status/204","timeout_ms":50,"weight":1},{"name":"dsp-3","url":"http://dsp-3/status/204","timeout_ms":50,"weight":1}]
+      - DSP_ENDPOINTS=[{"name":"dsp-1","url":"http://dsp-simulator:80/status/204","timeout_ms":50,"weight":1},{"name":"dsp-2","url":"http://dsp-simulator:80/status/204","timeout_ms":50,"weight":1},{"name":"dsp-3","url":"http://dsp-simulator:80/status/204","timeout_ms":50,"weight":1}]
     depends_on:
       postgres:
         condition: service_healthy
@@ -18,6 +21,19 @@ services:
         condition: service_healthy
       kafka:
         condition: service_started
+      otelcollector:
+        condition: service_started
+    networks:
+      - ssp-network
+
+  otelcollector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: ssp-otelcollector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
     networks:
       - ssp-network
 
@@ -29,7 +45,7 @@ services:
       - POSTGRES_PASSWORD=ssp
       - POSTGRES_DB=ssp_db
     ports:
-      - "5434:5432"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -44,9 +60,7 @@ services:
     image: redis:7-alpine
     container_name: ssp-redis
     ports:
-      - "6380:6379"
-    volumes:
-      - redis_data:/data
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -61,6 +75,9 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      # Kafka and ZooKeeper metadata must be reset together to avoid cluster ID mismatch.
+      - zookeeper_data:/var/lib/zookeeper/data
     networks:
       - ssp-network
 
@@ -79,31 +96,17 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     volumes:
+      # Kafka and ZooKeeper metadata must be reset together to avoid cluster ID mismatch.
       - kafka_data:/var/lib/kafka/data
     networks:
       - ssp-network
 
-  # DSP Simulators: 3 instances of httpbin to simulate multiple endpoints
-  dsp-1:
+  dsp-simulator:
     image: kennethreitz/httpbin
-    container_name: dsp-1
+    container_name: dsp-simulator
     ports:
       - "8081:80"
-    networks:
-      - ssp-network
-
-  dsp-2:
-    image: kennethreitz/httpbin
-    container_name: dsp-2
-    ports:
       - "8082:80"
-    networks:
-      - ssp-network
-
-  dsp-3:
-    image: kennethreitz/httpbin
-    container_name: dsp-3
-    ports:
       - "8083:80"
     networks:
       - ssp-network
@@ -114,5 +117,6 @@ networks:
 
 volumes:
   postgres_data:
-  redis_data:
+  # Keep kafka_data and zookeeper_data lifecycle in sync (clear together with `docker compose down -v`).
   kafka_data:
+  zookeeper_data:

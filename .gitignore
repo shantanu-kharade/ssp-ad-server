@@ -1,0 +1,13 @@
+# Binaries
+bin/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Environment files with secrets
+.env
+
+# k6 load test result files (keep the directory via results/.gitkeep)
+loadtest/results/*.json
