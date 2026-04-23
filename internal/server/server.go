@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gofiber/adaptor/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
 	"github.com/gofiber/fiber/v2/middleware/timeout"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
 	"github.com/yourusername/ssp-adserver/internal/ads"
@@ -20,7 +22,6 @@ import (
 	"github.com/yourusername/ssp-adserver/internal/events"
 	"github.com/yourusername/ssp-adserver/internal/handler"
 	"github.com/yourusername/ssp-adserver/internal/identity"
-	"github.com/yourusername/ssp-adserver/internal/metrics"
 	"github.com/yourusername/ssp-adserver/internal/middleware"
 	"github.com/yourusername/ssp-adserver/internal/resilience"
 )
@@ -95,9 +96,8 @@ func New(cfg *config.Config, log *zap.Logger, redisClient *cache.RedisClient, db
 	// Health check endpoint — lightweight, no timeout wrapper needed.
 	app.Get("/health", bidHandler.HandleHealth)
 
-	// Metrics endpoint — returns JSON with in-memory atomic counters.
-	// Supports ?reset=true to zero all counters.
-	app.Get("/metrics", handleMetrics())
+	// Metrics endpoint — exposes Prometheus metrics
+	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
 	// Bid endpoint with a 100ms hard timeout to meet SLA requirements.
 	app.Post("/bid", timeout.NewWithContext(bidHandler.HandleBid, 100*time.Millisecond))
@@ -120,21 +120,7 @@ func New(cfg *config.Config, log *zap.Logger, redisClient *cache.RedisClient, db
 	return app
 }
 
-// handleMetrics returns a Fiber handler for the GET /metrics endpoint.
-// It returns a JSON snapshot of all in-memory atomic counters. When the
-// query parameter reset=true is provided, counters are zeroed after
-// capturing the snapshot.
-func handleMetrics() fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		snapshot := metrics.GlobalCounters.Snapshot()
 
-		if c.Query("reset") == "true" {
-			metrics.GlobalCounters.Reset()
-		}
-
-		return c.Status(fiber.StatusOK).JSON(snapshot)
-	}
-}
 
 // Start begins listening on the configured port and blocks until the server
 // exits. It logs the listening address on startup.

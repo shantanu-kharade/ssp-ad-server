@@ -5,10 +5,17 @@ package handler
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
@@ -19,6 +26,7 @@ import (
 	"github.com/yourusername/ssp-adserver/internal/dsp"
 	"github.com/yourusername/ssp-adserver/internal/events"
 	"github.com/yourusername/ssp-adserver/internal/identity"
+	"github.com/yourusername/ssp-adserver/internal/metrics"
 	"github.com/yourusername/ssp-adserver/internal/models"
 	apperrors "github.com/yourusername/ssp-adserver/pkg/errors"
 )
@@ -37,6 +45,17 @@ type BidHandler struct {
 	campaignSvc *campaign.Service
 	producer    *events.EventProducer
 	eventQueue  chan events.ImpressionEvent
+	// nurlQueue carries win-notice fire requests to the bounded nurlWorker pool.
+	// Capacity of 1000 absorbs short bursts without blocking the hot path.
+	nurlQueue chan nurlFireEvent
+}
+
+// nurlFireEvent is the payload sent to nurlWorker for asynchronous NURL firing.
+type nurlFireEvent struct {
+	NURL          string
+	ClearingPrice float64
+	RequestID     string
+	ImpID         string
 }
 
 // NewBidHandler creates a new BidHandler with an initialised validator
@@ -53,11 +72,19 @@ func NewBidHandler(log *zap.Logger, segments *cache.SegmentFetcher, resolver *id
 		campaignSvc: campaignSvc,
 		producer:    producer,
 		eventQueue:  make(chan events.ImpressionEvent, 10000),
+		nurlQueue:   make(chan nurlFireEvent, 1000),
 	}
 
 	// Start bounded worker pool for impression events
-	for  i := 0; i < 16; i++ {
+	for i := 0; i < 16; i++ {
 		go h.eventWorker()
+	}
+
+	// Start bounded worker pool for NURL win-notice HTTP fires.
+	// 4 workers: each fire is a single outbound HTTP GET (200ms timeout),
+	// so 4 concurrent workers handles ~20 fires/s before queuing.
+	for i := 0; i < 4; i++ {
+		go h.nurlWorker()
 	}
 
 	return h
@@ -65,11 +92,54 @@ func NewBidHandler(log *zap.Logger, segments *cache.SegmentFetcher, resolver *id
 
 func (h *BidHandler) eventWorker() {
 	for event := range h.eventQueue {
+		metrics.ActiveGoroutines.Set(float64(len(h.eventQueue)))
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if err := h.producer.PublishImpressionEvent(ctx, event); err != nil {
 			h.log.Error("failed to publish impression event asynchronously", zap.Error(err), zap.String("request_id", event.RequestID))
 		}
 		cancel()
+	}
+}
+
+// nurlWorker drains nurlQueue and fires HTTP GET win notices to DSPs.
+// Each call uses a 200ms timeout per OpenRTB best-practice for win notices.
+// A single http.Client is shared across all fires in this worker — its
+// transport-level connection pool reuses keep-alive connections to the same DSP.
+func (h *BidHandler) nurlWorker() {
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	for evt := range h.nurlQueue {
+		// Substitute the clearing price macro before firing.
+		firedURL := strings.ReplaceAll(evt.NURL, "${AUCTION_PRICE}", fmt.Sprintf("%.4f", evt.ClearingPrice))
+
+		h.log.Debug("firing win notice (NURL)",
+			zap.String("request_id", evt.RequestID),
+			zap.String("imp_id", evt.ImpID),
+			zap.String("nurl", firedURL),
+			zap.Float64("clearing_price", evt.ClearingPrice),
+		)
+
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, firedURL, nil)
+		if err != nil {
+			h.log.Warn("failed to construct NURL request",
+				zap.String("request_id", evt.RequestID),
+				zap.String("imp_id", evt.ImpID),
+				zap.String("nurl", evt.NURL),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			h.log.Warn("NURL win notice fire failed",
+				zap.String("request_id", evt.RequestID),
+				zap.String("imp_id", evt.ImpID),
+				zap.String("nurl", firedURL),
+				zap.Error(err),
+			)
+			continue
+		}
+		resp.Body.Close()
 	}
 }
 
@@ -81,6 +151,19 @@ func (h *BidHandler) eventWorker() {
 //   - Returns 400 with structured validation errors for invalid payloads.
 //   - Returns 400 for malformed JSON that cannot be parsed.
 func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
+	start := time.Now()
+	publisherID := "unknown"
+	status := "error" // default to error
+	tracer := otel.Tracer("ssp-adserver/bid-handler")
+	ctx, span := tracer.Start(c.UserContext(), "bid.handle")
+	defer span.End()
+	c.SetUserContext(ctx)
+
+	defer func() {
+		metrics.BidLatencySeconds.Observe(time.Since(start).Seconds())
+		metrics.BidRequestsTotal.WithLabelValues(publisherID, status).Inc()
+	}()
+
 	var req models.BidRequest
 
 	// Parse the JSON request body.
@@ -89,11 +172,24 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 			"failed to parse bid request body",
 			fmt.Errorf("body parser error: %w", err),
 		)
-		h.log.Warn("bid request parse failure",
+		span.RecordError(apiErr)
+		span.SetStatus(codes.Error, "failed to parse bid request body")
+		h.log.Error("bid request parse failure",
 			zap.Error(apiErr),
+			zap.String("request_id", "unknown"),
+			zap.String("publisher_id", publisherID),
+			zap.String("auction_id", "unknown"),
+			zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 			zap.String("raw_body", string(c.Body())),
 		)
 		return c.Status(apiErr.StatusCode).JSON(apiErr)
+	}
+
+	// Extract publisher ID for metrics
+	if req.Site != nil && req.Site.Publisher != nil && req.Site.Publisher.ID != "" {
+		publisherID = req.Site.Publisher.ID
+	} else if req.App != nil && req.App.Publisher != nil && req.App.Publisher.ID != "" {
+		publisherID = req.App.Publisher.ID
 	}
 
 	// Resolve user ID
@@ -103,11 +199,15 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 
 	// Validate consent
 	if !h.consent.Validate(c) {
-		h.log.Info("bid request rejected: no consent", 
-			zap.String("request_id", req.ID), 
+		h.log.Warn("bid request rejected: no consent",
+			zap.String("publisher_id", publisherID),
+			zap.String("auction_id", req.ID),
+			zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			zap.String("request_id", req.ID),
 			zap.String("user_id", userID),
 		)
 		// Return empty bid response with NBR=0
+		status = "no_bid"
 		return c.Status(fiber.StatusOK).JSON(models.BidResponse{
 			ID:  req.ID,
 			NBR: 0,
@@ -122,6 +222,15 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 				"unexpected validation error type",
 				fmt.Errorf("validator returned non-ValidationErrors type: %w", err),
 			)
+			span.RecordError(apiErr)
+			span.SetStatus(codes.Error, "unexpected validation error type")
+			h.log.Error("unexpected validation error type",
+				zap.Error(apiErr),
+				zap.String("request_id", req.ID),
+				zap.String("publisher_id", publisherID),
+				zap.String("auction_id", req.ID),
+				zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			)
 			return c.Status(apiErr.StatusCode).JSON(apiErr)
 		}
 
@@ -131,8 +240,13 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 		}
 
 		apiErr := apperrors.NewValidationError("bid request validation failed", details)
-		h.log.Warn("bid request validation failure",
+		span.RecordError(apiErr)
+		span.SetStatus(codes.Error, "bid request validation failed")
+		h.log.Error("bid request validation failure",
 			zap.String("request_id", req.ID),
+			zap.String("publisher_id", publisherID),
+			zap.String("auction_id", req.ID),
+			zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 			zap.Any("details", details),
 		)
 		return c.Status(apiErr.StatusCode).JSON(apiErr)
@@ -160,23 +274,32 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 	// -------------------------------------------------------------------------
 
 	var (
-		userSegments    []string
+		userSegments     []string
 		matchedCampaigns []campaign.Campaign
-		dspBids         []auction.Bid
+		dspBids          []auction.Bid
 	)
 
-	g, gCtx := errgroup.WithContext(c.Context())
+	g, gCtx := errgroup.WithContext(ctx)
 
 	// Goroutine A: Redis segment lookup → campaign targeting evaluation.
 	// Failures are non-fatal: we degrade to empty segments / no internal bids.
 	g.Go(func() error {
-		userSegments = h.segments.FetchUserSegments(gCtx, userID)
+		segmentsCtx, segmentsSpan := tracer.Start(gCtx, "pipeline.fetch_segments")
+		defer segmentsSpan.End()
+		userSegments = h.segments.FetchUserSegments(segmentsCtx, userID)
 
+		evalCtx, evalSpan := tracer.Start(gCtx, "pipeline.evaluate_campaigns")
+		defer evalSpan.End()
 		var evalErr error
-		matchedCampaigns, evalErr = h.campaignSvc.EvaluateTargeting(gCtx, req, userSegments)
+		matchedCampaigns, evalErr = h.campaignSvc.EvaluateTargeting(evalCtx, req, userSegments)
 		if evalErr != nil {
-			h.log.Warn("targeting evaluation failed — continuing with no internal bids",
+			evalSpan.RecordError(evalErr)
+			evalSpan.SetStatus(codes.Error, "campaign evaluation failed")
+			h.log.Error("targeting evaluation failed — continuing with no internal bids",
 				zap.Error(evalErr),
+				zap.String("publisher_id", publisherID),
+				zap.String("auction_id", req.ID),
+				zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 				zap.String("request_id", req.ID),
 			)
 		}
@@ -186,13 +309,18 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 	// Goroutine B: DSP fanout. FetchBids handles its own error/timeout logic
 	// and returns an empty slice on failure, so we never return a hard error.
 	g.Go(func() error {
-		dspBids = h.fanout.FetchBids(gCtx, req)
+		fanoutCtx, fanoutSpan := tracer.Start(gCtx, "pipeline.dsp_fanout")
+		defer fanoutSpan.End()
+		dspBids = h.fanout.FetchBids(fanoutCtx, req)
 		return nil // always nil — FetchBids degrades gracefully
 	})
 
 	// Wait for both goroutines. Because both always return nil this can only
 	// fail if the parent context is cancelled.
-	_ = g.Wait()
+	if err := g.Wait(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "parallel pipeline failed")
+	}
 
 	// Map matched internal campaigns to auction bids.
 	var internalBids []auction.Bid
@@ -202,6 +330,10 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 		}
 		if camp.BidPriceCPM <= 0 {
 			h.log.Warn("skipping internal campaign with no configured bid price",
+				zap.String("publisher_id", publisherID),
+				zap.String("auction_id", req.ID),
+				zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+				zap.String("request_id", req.ID),
 				zap.String("campaign_id", camp.ID),
 				zap.String("campaign_name", camp.Name),
 			)
@@ -218,123 +350,129 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 		})
 	}
 
-	h.log.Info("processing bid request",
-		zap.String("request_id", req.ID),
-		zap.Int("impression_count", len(req.Imp)),
-		zap.String("user_id", userID),
-		zap.Strings("segments", userSegments),
-		zap.Int("matched_campaigns", len(matchedCampaigns)),
-	)
-
-	// Combine internal bids and DSP bids for the auction.
-	bids := append(dspBids, internalBids...)
-
-	// Extract BidFloor from the first impression
-	var floor float64
-	var impID string
-	var bannerW, bannerH int
-	if len(req.Imp) > 0 {
-		floor = req.Imp[0].BidFloor
-		impID = req.Imp[0].ID
-		if req.Imp[0].Banner != nil {
-			bannerW = req.Imp[0].Banner.W
-			bannerH = req.Imp[0].Banner.H
-		}
+	enableMultiImp := os.Getenv("ENABLE_MULTI_IMP") == "true"
+	impsToProcess := req.Imp
+	if !enableMultiImp && len(req.Imp) > 0 {
+		impsToProcess = []models.Impression{req.Imp[0]}
 	}
 
-	// Run Auction
-	result := auction.RunAuction(bids, floor, h.log)
+	seatBidsMap := make(map[string][]models.Bid)
 
-	var response models.BidResponse
-	var bidID string
-	var dealID string
-	var creativeID string
-	var winPrice float64
-
-	if result.Winner != nil {
-		bidID = "bid-" + req.ID
-		dealID = result.Winner.DealID
-		creativeID = result.Winner.CreativeID
-		winPrice = result.ClearingPrice
-
-		bid := models.Bid{
-			ID:    bidID,
-			ImpID: impID,
-			Price: winPrice,
-			AdID:  result.Winner.AdID,
-			CrID:  creativeID,
-			W:     bannerW,
-			H:     bannerH,
+	for _, imp := range impsToProcess {
+		floor := imp.BidFloor
+		impID := imp.ID
+		var bannerW, bannerH int
+		if imp.Banner != nil {
+			bannerW = imp.Banner.W
+			bannerH = imp.Banner.H
 		}
 
-		response = models.BidResponse{
-			ID: req.ID,
-			SeatBid: []models.SeatBid{
-				{
-					Bid:  []models.Bid{bid},
-					Seat: result.Winner.DSPName,
-				},
-			},
-			Cur: "USD",
+		// Filter DSP bids for this impression
+		var bidsForImp []auction.Bid
+		for _, b := range dspBids {
+			if b.ImpID == impID {
+				bidsForImp = append(bidsForImp, b)
+			}
 		}
-	} else {
-		// Fallback logic
-		var houseAd *models.Bid
-		if len(req.Imp) > 0 {
-			houseAd = h.houseAds.GetFallbackAd(req.Imp[0])
-		}
+		// Internal bids apply to the request generally, so include them for each imp
+		bidsForImp = append(bidsForImp, internalBids...)
 
-		if houseAd != nil {
-			h.log.Warn("serving house ad as fallback", zap.String("request_id", req.ID))
-			bidID = houseAd.ID
-			dealID = "house-deal"
-			creativeID = houseAd.CrID
-			winPrice = houseAd.Price
+		// Run Auction
+		_, auctionSpan := tracer.Start(ctx, "auction.run")
+		result := auction.RunAuction(bidsForImp, floor, h.log, req.AuctionType)
+		auctionSpan.End()
 
-			response = models.BidResponse{
-				ID: req.ID,
-				SeatBid: []models.SeatBid{
-					{
-						Bid:  []models.Bid{*houseAd},
-						Seat: "house-ad",
-					},
-				},
-				Cur: "USD",
+		if result.Winner != nil {
+			bidID := "bid-" + req.ID
+			if enableMultiImp {
+				bidID += "-" + imp.ID
+			}
+			dealID := result.Winner.DealID
+			creativeID := result.Winner.CreativeID
+			winPrice := result.ClearingPrice
+
+			bid := models.Bid{
+				ID:    bidID,
+				ImpID: impID,
+				Price: winPrice,
+				AdID:  result.Winner.AdID,
+				CrID:  creativeID,
+				W:     bannerW,
+				H:     bannerH,
+			}
+
+			seatBidsMap[result.Winner.DSPName] = append(seatBidsMap[result.Winner.DSPName], bid)
+			metrics.AuctionClearingPrice.Observe(winPrice)
+
+			// Publish ImpressionEvent asynchronously
+			h.publishImpressionEvent(ctx, req, bidID, impID, dealID, creativeID, winPrice, userID, floor, start, publisherID, span)
+
+			// Fire NURL win notice for external DSP wins only.
+			// Internal (house / direct campaign) wins have no upstream DSP to notify.
+			if result.Winner.DSPName != "internal" && result.Winner.NURL != "" {
+				h.fireNURL(result.Winner.NURL, winPrice, req.ID, impID)
 			}
 		} else {
-			return c.SendStatus(fiber.StatusNoContent)
+			// Fallback logic
+			houseAd := h.houseAds.GetFallbackAd(imp)
+			if houseAd != nil {
+				h.log.Warn("serving house ad as fallback",
+					zap.String("publisher_id", publisherID),
+					zap.String("auction_id", req.ID),
+					zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+					zap.String("request_id", req.ID),
+					zap.String("imp_id", imp.ID),
+				)
+				
+				bidID := houseAd.ID
+				if enableMultiImp {
+					bidID += "-" + imp.ID
+				}
+				
+				// Make sure we set the proper ImpID in the response
+				houseBid := *houseAd
+				houseBid.ID = bidID
+				houseBid.ImpID = imp.ID
+
+				seatBidsMap["house-ad"] = append(seatBidsMap["house-ad"], houseBid)
+				
+				// Publish ImpressionEvent for house ad
+				h.publishImpressionEvent(ctx, req, bidID, imp.ID, "house-deal", houseBid.CrID, houseBid.Price, userID, floor, start, publisherID, span)
+			}
 		}
 	}
 
-	// Publish ImpressionEvent asynchronously via the bounded worker pool.
-	// We construct the event synchronously and use a non-blocking send to
-	// prevent the bid response from blocking if the Kafka publisher is slow.
-	event := events.ImpressionEvent{
-		RequestID:    req.ID,
-		BidID:        bidID,
-		ImpressionID: impID,
-		CampaignID:   dealID,
-		CreativeID:   creativeID,
-		WinPrice:     winPrice,
-		UserID:       userID,
-		Timestamp:    time.Now().UTC(),
-		FloorPrice:   floor,
+	if len(seatBidsMap) == 0 {
+		status = "no_bid"
+		return c.SendStatus(fiber.StatusNoContent)
 	}
 
-	if req.Device != nil {
-		event.DeviceType = req.Device.DeviceType
-		if req.Device.Geo != nil {
-			event.GeoCountry = req.Device.Geo.Country
-			event.GeoCity = req.Device.Geo.City
-		}
+	var seatBids []models.SeatBid
+	for seat, bids := range seatBidsMap {
+		seatBids = append(seatBids, models.SeatBid{
+			Bid:  bids,
+			Seat: seat,
+		})
 	}
 
-	select {
-	case h.eventQueue <- event:
-		// Successfully queued
-	default:
-		h.log.Warn("event queue full, dropping impression event", zap.String("request_id", req.ID))
+	response := models.BidResponse{
+		ID:      req.ID,
+		SeatBid: seatBids,
+		Cur:     "USD",
 	}
+
+	status = "success"
+	if rand.Intn(100) == 0 {
+		h.log.Debug("sampled successful bid response",
+			zap.String("request_id", req.ID),
+			zap.String("publisher_id", publisherID),
+			zap.String("auction_id", req.ID),
+			zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			zap.String("winner_seat", response.SeatBid[0].Seat),
+		)
+	}
+
+
 
 	return c.Status(fiber.StatusOK).JSON(response)
 }
@@ -359,4 +497,72 @@ func (h *BidHandler) HandleHealth(c *fiber.Ctx) error {
 		"version": "1.0.0",
 		"kafka":   kafkaStatus,
 	})
+}
+
+// publishImpressionEvent queues an impression event for async processing.
+func (h *BidHandler) publishImpressionEvent(
+	ctx context.Context,
+	req models.BidRequest,
+	bidID, impID, dealID, creativeID string,
+	winPrice float64,
+	userID string,
+	floor float64,
+	start time.Time,
+	publisherID string,
+	span trace.Span,
+) {
+	event := events.ImpressionEvent{
+		RequestID:    req.ID,
+		BidID:        bidID,
+		ImpressionID: impID,
+		CampaignID:   dealID,
+		CreativeID:   creativeID,
+		WinPrice:     winPrice,
+		UserID:       userID,
+		Timestamp:    time.Now().UTC(),
+		FloorPrice:   floor,
+	}
+
+	if req.Device != nil {
+		event.DeviceType = req.Device.DeviceType
+		if req.Device.Geo != nil {
+			event.GeoCountry = req.Device.Geo.Country
+			event.GeoCity = req.Device.Geo.City
+		}
+	}
+
+	select {
+	case h.eventQueue <- event:
+		metrics.ActiveGoroutines.Set(float64(len(h.eventQueue)))
+	default:
+		span.SetStatus(codes.Error, "event queue full")
+		h.log.Error("event queue full, dropping impression event",
+			zap.String("request_id", req.ID),
+			zap.String("publisher_id", publisherID),
+			zap.String("auction_id", req.ID),
+			zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+		)
+	}
+}
+
+// fireNURL enqueues a NURL win-notice fire event onto the bounded nurlQueue.
+// It is non-blocking: if the queue is full it logs a warning and drops the
+// event rather than stalling the bid response.
+func (h *BidHandler) fireNURL(nurl string, clearingPrice float64, requestID, impID string) {
+	evt := nurlFireEvent{
+		NURL:          nurl,
+		ClearingPrice: clearingPrice,
+		RequestID:     requestID,
+		ImpID:         impID,
+	}
+	select {
+	case h.nurlQueue <- evt:
+		// queued successfully — nurlWorker will fire the HTTP GET
+	default:
+		h.log.Warn("NURL queue full, dropping win notice",
+			zap.String("request_id", requestID),
+			zap.String("imp_id", impID),
+			zap.String("nurl", nurl),
+		)
+	}
 }

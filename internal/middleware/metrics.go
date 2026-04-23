@@ -5,13 +5,10 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/zap"
-
-	"github.com/yourusername/ssp-adserver/internal/metrics"
 )
 
 // Metrics returns a Fiber middleware that logs structured metrics
-// for every HTTP request after it completes. It also records atomic
-// counters for the /metrics observability endpoint.
+// for every HTTP request after it completes.
 func Metrics(log *zap.Logger) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		start := time.Now()
@@ -20,9 +17,6 @@ func Metrics(log *zap.Logger) fiber.Handler {
 
 		latencyMs := time.Since(start).Milliseconds()
 		statusCode := c.Response().StatusCode()
-
-		// Record in-memory atomic counters for the /metrics endpoint.
-		metrics.GlobalCounters.Record(statusCode, latencyMs)
 
 		requestID := c.Get("X-Request-ID")
 		if requestID == "" {

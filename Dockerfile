@@ -1,9 +1,5 @@
 # Stage 1: Builder
 FROM golang:1.25-alpine AS builder
-
-# Install build dependencies
-# RUN apk add --no-cache git
-
 WORKDIR /app
 
 # Copy go.mod and go.sum for layer caching
@@ -19,21 +15,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o ssp-ad-server ./cmd/se
 # Stage 2: Final Image
 FROM alpine:3.19
 
-# Install CA certificates for secure connections (HTTPS DSPs)
-# RUN apk add --no-cache ca-certificates
-
 # Create a non-root user for security
-RUN adduser -D -g '' sspuser
+RUN adduser -D sspuser
 
-WORKDIR /home/sspuser
+WORKDIR /app
 
 # Copy the binary from the builder stage
 COPY --from=builder /app/ssp-ad-server .
-# Copy migrations for database setup
 COPY --from=builder /app/internal/db/migrations ./internal/db/migrations
-
-# Change ownership to the non-root user
-RUN chown sspuser:sspuser ssp-ad-server
 
 # Use the non-root user
 USER sspuser

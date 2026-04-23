@@ -17,6 +17,10 @@ type Bid struct {
 	AdID       string
 	DSPName    string
 	CreativeID string
+	ImpID      string
+	// NURL is the DSP's win notice URL. The SSP must fire a GET to this URL
+	// (with ${AUCTION_PRICE} substituted) when this bid wins the auction.
+	NURL string
 }
 
 // AuctionResult holds the outcome of an auction.

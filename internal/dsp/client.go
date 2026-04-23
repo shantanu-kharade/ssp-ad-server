@@ -10,6 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
 	"github.com/yourusername/ssp-adserver/internal/auction"
 	"github.com/yourusername/ssp-adserver/internal/models"
 	"github.com/yourusername/ssp-adserver/internal/resilience"
@@ -96,6 +100,14 @@ func (c *Client) CircuitBreaker() *resilience.DSPCircuitBreaker {
 
 // FetchBid sends a BidRequest to the DSP and parses the response.
 func (c *Client) FetchBid(ctx context.Context, req models.BidRequest) ([]auction.Bid, error) {
+	tracer := otel.Tracer("ssp-adserver/dsp-client")
+	ctx, span := tracer.Start(
+		ctx,
+		"dsp.bid",
+	)
+	span.SetAttributes(attribute.String("dsp.id", c.config.Name))
+	defer span.End()
+
 	res, err := c.cb.Execute(ctx, func() (interface{}, error) {
 		bids, fetchErr := c.doFetch(ctx, req)
 		// ErrNoBid is a valid RTB outcome, not a system failure.
@@ -107,8 +119,12 @@ func (c *Client) FetchBid(ctx context.Context, req models.BidRequest) ([]auction
 
 	if err != nil {
 		if errors.Is(err, resilience.ErrCircuitOpen) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "circuit breaker open")
 			return nil, resilience.ErrCircuitOpen
 		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "dsp fetch failed")
 		return nil, err
 	}
 
@@ -173,12 +189,14 @@ func (c *Client) doFetch(ctx context.Context, req models.BidRequest) ([]auction.
 	for _, seatBid := range bidResp.SeatBid {
 		for _, bid := range seatBid.Bid {
 			parsedBids = append(parsedBids, auction.Bid{
-				DealID:     "open-deal", // Mocked deal mapping 
+				DealID:     "open-deal", // Mocked deal mapping
 				DealType:   auction.Open,
 				Price:      bid.Price,
 				AdID:       bid.AdID,
 				DSPName:    c.config.Name,
 				CreativeID: bid.CrID,
+				ImpID:      bid.ImpID,
+				NURL:       bid.NURL,
 			})
 		}
 	}
