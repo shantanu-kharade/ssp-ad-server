@@ -166,21 +166,13 @@ func (h *BidHandler) HandleBid(c *fiber.Ctx) error {
 
 	var req models.BidRequest
 
-	// Parse the JSON request body.
 	if err := c.BodyParser(&req); err != nil {
-		apiErr := apperrors.NewBadRequestError(
-			"failed to parse bid request body",
-			fmt.Errorf("body parser error: %w", err),
-		)
+		apiErr := apperrors.NewValidationError("malformed JSON body", map[string]string{"body": err.Error()})
 		span.RecordError(apiErr)
-		span.SetStatus(codes.Error, "failed to parse bid request body")
-		h.log.Error("bid request parse failure",
-			zap.Error(apiErr),
-			zap.String("request_id", "unknown"),
-			zap.String("publisher_id", publisherID),
-			zap.String("auction_id", "unknown"),
+		span.SetStatus(codes.Error, "malformed JSON body")
+		h.log.Error("failed to parse bid request body",
+			zap.Error(err),
 			zap.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-			zap.String("raw_body", string(c.Body())),
 		)
 		return c.Status(apiErr.StatusCode).JSON(apiErr)
 	}

@@ -47,7 +47,7 @@ type ServerConfig struct {
 	// HouseAdPrice is the clearing price of the fallback house ad.
 	HouseAdPrice float64 `envconfig:"HOUSE_AD_PRICE" default:"0.01"`
 	// DBURL is the PostgreSQL connection string.
-	DBURL string `envconfig:"DB_URL" default:"postgres://ssp:ssp@localhost:5432/ssp_db?sslmode=disable"`
+	DBURL string `envconfig:"DB_URL" default:"postgres://ssp:ssp@localhost:5433/ssp_db?sslmode=disable"`
 }
 
 // LogConfig holds logging-specific settings.

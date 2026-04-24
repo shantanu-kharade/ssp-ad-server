@@ -16,7 +16,7 @@ GOFMT=gofmt
 LDFLAGS=-ldflags "-s -w"
 
 # Database
-DB_URL ?= postgresql://ssp:ssp@localhost:5432/ssp_db?sslmode=disable
+DB_URL ?= postgresql://ssp:ssp@localhost:5433/ssp_db?sslmode=disable
 MIGRATIONS_DIR = internal/db/migrations
 
 ## build: Compile the binary

@@ -10,7 +10,7 @@ services:
       - SERVER_PORT=8080
       - LOG_LEVEL=debug
       - OTEL_EXPORTER_OTLP_ENDPOINT=otelcollector:4317
-      - DB_URL=postgres://ssp:ssp@postgres:5432/ssp_db?sslmode=disable
+      - DB_URL=postgres://ssp:ssp@postgres:5433/ssp_db?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - KAFKA_BROKERS=kafka:9092
       - DSP_ENDPOINTS=[{"name":"dsp-1","url":"http://dsp-simulator:80/status/204","timeout_ms":50,"weight":1},{"name":"dsp-2","url":"http://dsp-simulator:80/status/204","timeout_ms":50,"weight":1},{"name":"dsp-3","url":"http://dsp-simulator:80/status/204","timeout_ms":50,"weight":1}]
@@ -45,7 +45,7 @@ services:
       - POSTGRES_PASSWORD=ssp
       - POSTGRES_DB=ssp_db
     ports:
-      - "5432:5432"
+      - "5433:5433"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
